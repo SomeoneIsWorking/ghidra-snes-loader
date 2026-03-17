@@ -7,10 +7,11 @@ import ghidra.app.util.Option;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.AbstractProgramLoader;
+import ghidra.app.util.opinion.LoadException;
 import ghidra.app.util.opinion.LoadSpec;
+import ghidra.app.util.opinion.Loaded;
 import ghidra.app.util.opinion.Loader;
 import ghidra.app.util.opinion.LoaderTier;
-import ghidra.framework.model.DomainFolder;
 import ghidra.framework.model.DomainObject;
 import ghidra.program.model.lang.CompilerSpec;
 import ghidra.program.model.lang.Endian;
@@ -98,21 +99,24 @@ public class SnesLoader extends AbstractProgramLoader {
 	}
 
 	@Override
-	protected boolean loadProgramInto(ByteProvider provider, LoadSpec loadSpec,
-			List<Option> options, MessageLog log, Program prog, TaskMonitor monitor) {
-		return false;
+	protected void loadProgramInto(Program prog, ImporterSettings settings)
+			throws IOException, LoadException, CancelledException {
+		Collection<RomInfo> detectedRomKinds = detectRomKind(settings.provider());
+		if (detectedRomKinds.size() == 0) {
+			throw new IOException("Not a valid SNES ROM");
+		}
+		RomInfo romInfo = detectedRomKinds.iterator().next();
+		loadWithTransaction(settings.provider(), settings.loadSpec(), settings.options(), settings.log(), prog,
+				settings.monitor(), romInfo);
 	}
 
 	@Override
-	protected List<Program> loadProgram(ByteProvider provider, String programName,
-			DomainFolder programFolder, LoadSpec loadSpec, List<Option> options, MessageLog log,
-			Object consumer, TaskMonitor monitor)
-			throws IOException, CancelledException {
-		List<Program> programs = new ArrayList<Program>();
-		Collection<RomInfo> detectedRomKinds = detectRomKind(provider);
+	protected List<Loaded<Program>> loadProgram(ImporterSettings settings)
+			throws IOException, LoadException, CancelledException {
+		List<Loaded<Program>> programs = new ArrayList<>();
+		Collection<RomInfo> detectedRomKinds = detectRomKind(settings.provider());
 		if (detectedRomKinds.size() == 0) {
-			// Weird but ok.
-			throw new IOException("Not a valid SNES ROM (has the file changed since starting the import?)");
+			throw new IOException("Not a valid SNES ROM");
 		}
 		if (detectedRomKinds.size() > 1) {
 			String errSummary = "Can't uniquely determine what kind of SNES ROM this is.";
@@ -126,23 +130,15 @@ public class SnesLoader extends AbstractProgramLoader {
 			Msg.showError(this, null, "Can't load ROM", sb.toString());
 			return programs;
 		}
-		if (!loadSpec.isComplete()) {
-			Msg.debug(this, "loadSpec is not complete.");
-			return programs;
-		}
 
-		LanguageCompilerSpecPair pair = loadSpec.getLanguageCompilerSpec();
-		Language importerLanguage = getLanguageService().getLanguage(pair.languageID);
-		CompilerSpec importerCompilerSpec =
-			importerLanguage.getCompilerSpecByID(pair.compilerSpecID);
-
-		Program prog = createProgram(provider, programName, null, getName(),
-			importerLanguage, importerCompilerSpec, consumer);
-
+		Program prog = createProgram(settings);
 		RomInfo romInfo = detectedRomKinds.iterator().next();
-		boolean success = loadWithTransaction(provider, loadSpec, options, log, prog, monitor, romInfo);
+		boolean success = loadWithTransaction(settings.provider(), settings.loadSpec(), settings.options(),
+				settings.log(), prog, settings.monitor(), romInfo);
 		if (success) {
-			programs.add(prog);
+			programs.add(new Loaded<>(prog, settings));
+		} else {
+			prog.release(settings.consumer());
 		}
 
 		return programs;
@@ -166,15 +162,15 @@ public class SnesLoader extends AbstractProgramLoader {
 	}
 
 	@Override
-	public List<Option> getDefaultOptions(ByteProvider provider, LoadSpec loadSpec,
-			DomainObject domainObject, boolean isLoadIntoProgram) {
-		List<Option> list =
-			super.getDefaultOptions(provider, loadSpec, domainObject, isLoadIntoProgram);
+	public List<Option> getDefaultOptions(ByteProvider provider, LoadSpec loadSpec, DomainObject domainObject,
+			boolean isLoadIntoProgram, boolean isExpertContext) {
+		List<Option> list = super.getDefaultOptions(provider, loadSpec, domainObject, isLoadIntoProgram,
+				isExpertContext);
 
 		list.add(new Option(APPLY_SNES_LABELS_OPTION_NAME, true, Boolean.class,
-			Loader.COMMAND_LINE_ARG_PREFIX + "-applySnesLabels"));
+				Loader.COMMAND_LINE_ARG_PREFIX + "-applySnesLabels"));
 		list.add(new Option(ANCHOR_SNES_LABELS_OPTION_NAME, true, Boolean.class,
-			Loader.COMMAND_LINE_ARG_PREFIX + "-anchorSnesLabels"));
+				Loader.COMMAND_LINE_ARG_PREFIX + "-anchorSnesLabels"));
 
 		return list;
 	}
