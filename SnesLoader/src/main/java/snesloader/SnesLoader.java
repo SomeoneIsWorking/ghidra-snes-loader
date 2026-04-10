@@ -60,19 +60,25 @@ public class SnesLoader extends AbstractProgramLoader {
 	public Collection<LoadSpec> findSupportedLoadSpecs(ByteProvider provider) throws IOException {
 		List<LoadSpec> loadSpecs = new ArrayList<>();
 		getLanguageService();  // Ensure Processors are loaded.
-		Processor snesProcessor;
-		try {
-			snesProcessor = Processor.toProcessor("65816");
-		} catch (ProcessorNotFoundException e) {
+		Processor snesProcessor = null;
+		for (String processorName : List.of("65816", "65C02", "6502")) {
+			try {
+				snesProcessor = Processor.toProcessor(processorName);
+				break;
+			}
+			catch (ProcessorNotFoundException ignored) {
+				// Try next fallback.
+			}
+		}
+		if (snesProcessor == null) {
 			return loadSpecs;
 		}
 
 		Collection<RomInfo> detectedRomKinds = detectRomKind(provider);
 		if (!detectedRomKinds.isEmpty()) {
 			LanguageCompilerSpecQuery query = new LanguageCompilerSpecQuery(
-				snesProcessor, Endian.LITTLE, SIXTEEN_BIT, null, null);
-			List<LanguageCompilerSpecPair> lcsps =
-				getLanguageService().getLanguageCompilerSpecPairs(query);
+				snesProcessor, Endian.LITTLE, null, null, null);
+			List<LanguageCompilerSpecPair> lcsps = getLanguageService().getLanguageCompilerSpecPairs(query);
 			for (LanguageCompilerSpecPair lcsp : lcsps) {
 				loadSpecs.add(new LoadSpec(this, 0, lcsp, false));
 			}
