@@ -25,6 +25,10 @@ import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 import snesloader.RomInfo.RomKind;
+import ghidra.program.model.address.*;
+import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.app.util.bin.BinaryReader;
 
 /**
  * TODO: Provide class-level documentation that describes what this loader does.
@@ -107,15 +111,80 @@ public class SnesLoader extends AbstractProgramLoader {
 	@Override
 	protected void loadProgramInto(Program prog, ImporterSettings settings)
 			throws IOException, LoadException, CancelledException {
+
 		Collection<RomInfo> detectedRomKinds = detectRomKind(settings.provider());
 		if (detectedRomKinds.size() == 0) {
 			throw new IOException("Not a valid SNES ROM");
 		}
-		RomInfo romInfo = detectedRomKinds.iterator().next();
-		loadWithTransaction(settings.provider(), settings.loadSpec(), settings.options(), settings.log(), prog,
-				settings.monitor(), romInfo);
-	}
 
+		RomInfo romInfo = detectedRomKinds.iterator().next();
+
+		loadWithTransaction(
+			settings.provider(),
+			settings.loadSpec(),
+			settings.options(),
+			settings.log(),
+			prog,
+			settings.monitor(),
+			romInfo
+		);
+
+		// Adding functionality for analysis
+		// === SNES Helper Start ===
+		try {
+			AddressFactory af = prog.getAddressFactory();
+			AddressSpace space = af.getDefaultAddressSpace();
+
+			// Reset Vector (LoROM: 0x7FFC)
+			BinaryReader reader = new BinaryReader(settings.provider(), true);
+			int lo = reader.readUnsignedByte(0x7FFC);
+			int hi = reader.readUnsignedByte(0x7FFD);
+			int entryAddr = (hi << 8) | lo;
+
+			Address entry = space.getAddress(entryAddr & 0xFFFF);
+
+			// Funktion am Entry Point erstellen
+			prog.getFunctionManager().createFunction(
+				"entry_point",
+				entry,
+				new AddressSet(entry),
+				SourceType.USER_DEFINED
+			);
+
+			// Alle JSR/JSL finden und Funktionen erstellen
+			Listing listing = prog.getListing();
+			InstructionIterator it = listing.getInstructions(true);
+
+			while (it.hasNext()) {
+				Instruction instr = it.next();
+				String mnem = instr.getMnemonicString();
+
+				if (mnem.equals("JSR") || mnem.equals("JSL")) {
+					Object[] ops = instr.getOpObjects(0);
+					if (ops.length > 0 && ops[0] instanceof Address) {
+						Address target = (Address) ops[0];
+						try {
+							prog.getFunctionManager().createFunction(
+								String.format("sub_%06X", target.getOffset()),
+								target,
+								new AddressSet(target),
+								SourceType.ANALYSIS
+							);
+						} catch (Exception e) {
+							// ignore duplicates
+						}
+					}
+				}
+			}
+
+			Msg.info(this, "SNES helper applied.");
+
+		} catch (Exception e) {
+			Msg.error(this, "SNES helper failed: " + e.getMessage());
+		}
+		// === SNES Helper End ===
+	}
+	
 	@Override
 	protected List<Loaded<Program>> loadProgram(ImporterSettings settings)
 			throws IOException, LoadException, CancelledException {
