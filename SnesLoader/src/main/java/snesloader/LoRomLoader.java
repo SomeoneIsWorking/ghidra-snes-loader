@@ -18,40 +18,57 @@ import snesloader.RomReader.RomChunk;
 
 public class LoRomLoader implements RomInfoProvider {
 	public static final long SNES_HEADER_OFFSET = 0x7FC0;
-	public static final long MAX_ROM_SIZE = 0x40_0000;
+	public static final long MAX_ROM_SIZE = 0x80_0000;
 	public static final int ROM_CHUNK_SIZE = 0x8000;
 
 	public static boolean load(ByteProvider provider, LoadSpec loadSpec, List<Option> options, MessageLog log,
 			Program prog, TaskMonitor monitor, RomInfo romInfo) throws IOException {
 		AddressSpace busSpace = prog.getAddressFactory().getDefaultAddressSpace();
+		boolean supports24BitBus = busSpace.getMaxAddress().getOffset() >= 0xFF_FFFF;
 
 		RomReader reader = new RomReader(romInfo, provider);
 		for (RomChunk romChunk : reader) {
-			List<Address> busAddresses = getBusAddressesForRomChunk(romChunk, busSpace);
-
 			String primaryBlockName = getRomChunkPrimaryName(romChunk);
-			Address primaryAddress = busAddresses.remove(0);
-			try {
-				MemoryBlockUtils.createInitializedBlock(prog, false, primaryBlockName, primaryAddress,
-						romChunk.getInputStream(), romChunk.getLength(), "", provider.getAbsolutePath(), true, false,
-						true, log, monitor);
-			} catch (AddressOverflowException e) {
-				throw new IllegalStateException("Invalid address range specified: start:" + primaryAddress + ", length:"
-						+ romChunk.getLength() + " - end address exceeds address space boundary!");
-			}
 
-			int mirrorNum = 1;
-			for (Address mirrorAddress : busAddresses) {
-				String mirrorBlockName = getRomChunkMirrorName(romChunk, mirrorNum);
-				MemoryBlockUtils.createByteMappedBlock(prog, mirrorBlockName, mirrorAddress, primaryAddress,
-						(int) romChunk.getLength(), String.format("mirror of %s", primaryBlockName), "", true, false,
-						true, false, log);
-				mirrorNum++;
+			if (supports24BitBus) {
+				List<Address> busAddresses = getBusAddressesForRomChunk(romChunk, busSpace);
+				Address primaryAddress = busAddresses.remove(0);
+				try {
+					MemoryBlockUtils.createInitializedBlock(prog, false, primaryBlockName, primaryAddress,
+							romChunk.getInputStream(), romChunk.getLength(), "", provider.getAbsolutePath(), true, false,
+							true, log, monitor);
+				} catch (AddressOverflowException e) {
+					throw new IllegalStateException(
+						"Invalid address range specified: start:" + primaryAddress + ", length:"
+							+ romChunk.getLength() + " - end address exceeds address space boundary!");
+				}
+
+				int mirrorNum = 1;
+				for (Address mirrorAddress : busAddresses) {
+					String mirrorBlockName = getRomChunkMirrorName(romChunk, mirrorNum);
+					MemoryBlockUtils.createByteMappedBlock(prog, mirrorBlockName, mirrorAddress, primaryAddress,
+							(int) romChunk.getLength(), String.format("mirror of %s", primaryBlockName), "", true, false,
+							true, false, log);
+					mirrorNum++;
+				}
+			}
+			else {
+				// Fallback for 16-bit CPU languages (e.g., 6502/65C02): map each LoROM bank as its own
+				// overlay block at 0x8000-0xffff so large SNES ROMs still load instead of failing with
+				// AddressOutOfBoundsException on 24-bit bus addresses.
+				Address primaryAddress = busSpace.getAddress(0x8000);
+				try {
+					MemoryBlockUtils.createInitializedBlock(prog, true, primaryBlockName, primaryAddress,
+							romChunk.getInputStream(), romChunk.getLength(), "", provider.getAbsolutePath(), true, false,
+							true, log, monitor);
+				}
+				catch (AddressOverflowException e) {
+					throw new IllegalStateException(
+						"Invalid address range specified: start:" + primaryAddress + ", length:"
+							+ romChunk.getLength() + " - end address exceeds address space boundary!");
+				}
 			}
 		}
-
-		// throw new UnsupportedOperationException("Loading a LO_ROM format is not
-		// implemented yet.");
 
 		return true;
 	}
