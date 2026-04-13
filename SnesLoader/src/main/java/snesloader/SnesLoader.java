@@ -101,8 +101,8 @@ public class SnesLoader extends AbstractProgramLoader {
 			return loadSpecs;
 		}
 
-		Collection<RomInfo> detectedRomKinds = detectRomKind(provider);
-		if (!detectedRomKinds.isEmpty()) {
+		RomInfo detectedRomKind = detectBestRomKindOrNull(provider);
+		if (detectedRomKind != null) {
 			LanguageCompilerSpecQuery query = new LanguageCompilerSpecQuery(
 				snesProcessor, Endian.LITTLE, null, null, null);
 			List<LanguageCompilerSpecPair> lcsps = getLanguageService().getLanguageCompilerSpecPairs(query);
@@ -114,21 +114,25 @@ public class SnesLoader extends AbstractProgramLoader {
 		return loadSpecs;
 	}
 
-	private Collection<RomInfo> detectRomKind(ByteProvider provider) {
-		Collection<RomInfo> validRomKinds = new HashSet<RomInfo>();
+	private RomInfo detectBestRomKindOrNull(ByteProvider provider) {
 		RomInfo[] candidateRomKinds = new RomInfo[] {
 			new RomInfo(RomKind.LO_ROM, true),
 			new RomInfo(RomKind.LO_ROM, false),
 			new RomInfo(RomKind.HI_ROM, true),
 			new RomInfo(RomKind.HI_ROM, false)};
 
+		RomInfo bestRomKind = null;
+		int bestScore = RomInfo.INVALID_DETECTION_SCORE;
 		for (RomInfo rom : candidateRomKinds) {
-			if (rom.bytesLookValid(provider)) {
-				validRomKinds.add(rom);
+			// Evaluate all mapping/header combinations and keep the strongest match.
+			int score = rom.calculateDetectionScore(provider);
+			if (score > bestScore) {
+				bestScore = score;
+				bestRomKind = rom;
 			}
 		}
 
-		return validRomKinds;
+		return bestRomKind;
 	}
 
 	@Override
@@ -209,21 +213,12 @@ public class SnesLoader extends AbstractProgramLoader {
 	}
 
 	private RomInfo detectUniqueRomKind(ByteProvider provider) throws IOException {
-		Collection<RomInfo> detectedRomKinds = detectRomKind(provider);
-		if (detectedRomKinds.isEmpty()) {
+		RomInfo bestRomKind = detectBestRomKindOrNull(provider);
+		// If nothing scores above the invalid threshold, this is not a SNES ROM we can parse.
+		if (bestRomKind == null) {
 			throw new IOException("Not a valid SNES ROM");
 		}
-		if (detectedRomKinds.size() > 1) {
-			StringBuilder sb = new StringBuilder("Can't uniquely determine what kind of SNES ROM this is.");
-			sb.append(" Could be any of:");
-			sb.append(System.lineSeparator());
-			for (RomInfo rom : detectedRomKinds) {
-				sb.append(rom.getDescription());
-				sb.append(System.lineSeparator());
-			}
-			throw new IOException(sb.toString().trim());
-		}
-		return detectedRomKinds.iterator().next();
+		return bestRomKind;
 	}
 
 	private void applySnesAnalysisHelpers(Program prog, ByteProvider provider, List<Option> options, RomInfo romInfo) {
