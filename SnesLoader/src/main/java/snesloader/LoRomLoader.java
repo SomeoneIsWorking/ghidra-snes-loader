@@ -1,20 +1,22 @@
 package snesloader;
 
 import java.io.IOException;
-import java.util.ArrayList;
+import java.io.InputStream;
 import java.util.List;
 
-import ghidra.app.util.MemoryBlockUtils;
 import ghidra.app.util.Option;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.LoadSpec;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.address.AddressOverflowException;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.SymbolTable;
+import ghidra.util.Msg;
 import ghidra.util.task.TaskMonitor;
-import snesloader.RomReader.RomChunk;
 
 public class LoRomLoader implements RomInfoProvider {
 	public static final long SNES_HEADER_OFFSET = 0x7FC0;
@@ -23,87 +25,57 @@ public class LoRomLoader implements RomInfoProvider {
 
 	public static boolean load(ByteProvider provider, LoadSpec loadSpec, List<Option> options, MessageLog log,
 			Program prog, TaskMonitor monitor, RomInfo romInfo) throws IOException {
+		long startOffset = romInfo.getStartOffset();
+		long romLength = provider.length() - startOffset;
+		int bankCount = (int) (romLength / ROM_CHUNK_SIZE);
+		// One summary log for LoROM memory mapping extent.
+		Msg.info(LoRomLoader.class, "LoROM banks mapped: " + bankCount);
+
 		AddressSpace busSpace = prog.getAddressFactory().getDefaultAddressSpace();
-		boolean supports24BitBus = busSpace.getMaxAddress().getOffset() >= 0xFF_FFFF;
+		Memory memory = prog.getMemory();
 
-		RomReader reader = new RomReader(romInfo, provider);
-		for (RomChunk romChunk : reader) {
-			String primaryBlockName = getRomChunkPrimaryName(romChunk);
+		for (int bank = 0; bank < bankCount; bank++) {
+			long providerOffset = startOffset + ((long) bank * ROM_CHUNK_SIZE);
+			long snesAddress = (((long) bank) << 16) | 0x8000L;
+			Address blockStart = busSpace.getAddress(snesAddress);
+			String blockName = String.format("rom_%02x:8000-%02x:ffff", bank & 0xff, bank & 0xff);
 
-			if (supports24BitBus) {
-				List<Address> busAddresses = getBusAddressesForRomChunk(romChunk, busSpace);
-				Address primaryAddress = busAddresses.remove(0);
-				try {
-					MemoryBlockUtils.createInitializedBlock(prog, false, primaryBlockName, primaryAddress,
-							romChunk.getInputStream(), romChunk.getLength(), "", provider.getAbsolutePath(), true, false,
-							true, log, monitor);
-				} catch (AddressOverflowException e) {
-					throw new IllegalStateException(
-						"Invalid address range specified: start:" + primaryAddress + ", length:"
-							+ romChunk.getLength() + " - end address exceeds address space boundary!");
-				}
-
-				int mirrorNum = 1;
-				for (Address mirrorAddress : busAddresses) {
-					String mirrorBlockName = getRomChunkMirrorName(romChunk, mirrorNum);
-					MemoryBlockUtils.createByteMappedBlock(prog, mirrorBlockName, mirrorAddress, primaryAddress,
-							(int) romChunk.getLength(), String.format("mirror of %s", primaryBlockName), "", true, false,
-							true, false, log);
-					mirrorNum++;
-				}
+			try (InputStream in = provider.getInputStream(providerOffset)) {
+				MemoryBlock block = memory.createInitializedBlock(blockName, blockStart, in, ROM_CHUNK_SIZE, monitor,
+					false);
+				block.setRead(true);
+				block.setWrite(false);
+				block.setExecute(true);
 			}
-			else {
-				// Fallback for 16-bit CPU languages (e.g., 6502/65C02): map each LoROM bank as its own
-				// overlay block at 0x8000-0xffff so large SNES ROMs still load instead of failing with
-				// AddressOutOfBoundsException on 24-bit bus addresses.
-				Address primaryAddress = busSpace.getAddress(0x8000);
-				try {
-					MemoryBlockUtils.createInitializedBlock(prog, true, primaryBlockName, primaryAddress,
-							romChunk.getInputStream(), romChunk.getLength(), "", provider.getAbsolutePath(), true, false,
-							true, log, monitor);
-				}
-				catch (AddressOverflowException e) {
-					throw new IllegalStateException(
-						"Invalid address range specified: start:" + primaryAddress + ", length:"
-							+ romChunk.getLength() + " - end address exceeds address space boundary!");
-				}
+			catch (Exception e) {
+				throw new IOException(
+					String.format("Failed to map LoROM bank %02X at %06X from file offset %06X", bank & 0xff,
+						snesAddress, providerOffset),
+					e);
 			}
+		}
+
+		// LoROM reset vector is stored at PC offset 0x7FFC (no copier header), little-endian.
+		long resetVectorOffset = startOffset + 0x7FFCL;
+		int resetVector = Byte.toUnsignedInt(provider.readBytes(resetVectorOffset, 1)[0]) |
+			(Byte.toUnsignedInt(provider.readBytes(resetVectorOffset + 1, 1)[0]) << 8);
+		// Reset vector is read from LoROM header and interpreted in bank 00.
+		Msg.info(LoRomLoader.class, String.format("Reset vector: 0x%04X", resetVector & 0xFFFF));
+		long entrySnesAddress = ((0x00L << 16) | (resetVector & 0xFFFFL));
+		Msg.info(LoRomLoader.class, String.format("Resolved entry point: 0x%06X", entrySnesAddress & 0xFFFFFFL));
+		Address entryAddress = busSpace.getAddress(entrySnesAddress);
+		SymbolTable symbolTable = prog.getSymbolTable();
+		symbolTable.addExternalEntryPoint(entryAddress);
+		try {
+			if (symbolTable.getGlobalSymbol("entry_point", entryAddress) == null) {
+				symbolTable.createLabel(entryAddress, "entry_point", SourceType.ANALYSIS);
+			}
+		}
+		catch (Exception e) {
+			throw new IOException("Failed to create entry_point label", e);
 		}
 
 		return true;
-	}
-
-	private static List<Address> getBusAddressesForRomChunk(RomChunk chunk, AddressSpace space) {
-		var busAddresses = new ArrayList<Address>();
-		long chunkStartAddress = chunk.getRomAddresses().left;
-
-		// Primary mapping.
-		if (chunkStartAddress <= 0x3e_8000) {
-			// Map to 00-7d:8000-ffff
-			busAddresses.add(space.getAddress(((chunkStartAddress / 0x8000) * 0x1_0000) + 0x8000));
-		}
-		// Gap in banks 7e and 7f for RAM.
-
-		// Mirroring, and primary mapping of 3f:0000-8000 to fe-ff:8000-ffff.
-		busAddresses.add(space.getAddress(((chunkStartAddress / 0x8000) * 0x1_0000) + 0x80_8000));
-
-		return busAddresses;
-	}
-
-	private static String getRomChunkPrimaryName(RomChunk chunk) {
-		long leftAddr = chunk.getRomAddresses().left;
-		int leftBank = (int) ((leftAddr & 0xff_0000) >> 16);
-		int leftSmall = (int) (leftAddr & 0xffff);
-
-		long rightAddr = chunk.getRomAddresses().right;
-		int rightBank = (int) ((rightAddr & 0xff_0000) >> 16);
-		int rightSmall = (int) (rightAddr & 0xffff);
-
-		return String.format("rom_%02x:%04x-%02x:%04x", leftBank, leftSmall, rightBank, rightSmall);
-	}
-
-	private static String getRomChunkMirrorName(RomChunk chunk, int mirrorNum) {
-		return String.format("%s_mirror%d", getRomChunkPrimaryName(chunk), mirrorNum);
 	}
 
 	@Override

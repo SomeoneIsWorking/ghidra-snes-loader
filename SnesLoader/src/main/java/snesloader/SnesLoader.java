@@ -19,6 +19,7 @@ import ghidra.program.model.lang.LanguageCompilerSpecPair;
 import ghidra.program.model.lang.LanguageCompilerSpecQuery;
 import ghidra.program.model.lang.Processor;
 import ghidra.program.model.lang.ProcessorNotFoundException;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.SymbolTable;
 import ghidra.util.Msg;
@@ -139,8 +140,31 @@ public class SnesLoader extends AbstractProgramLoader {
 	protected void loadProgramInto(Program prog, ImporterSettings settings)
 			throws IOException, LoadException, CancelledException {
 		RomInfo romInfo = detectUniqueRomKind(settings.provider());
-		loadWithTransaction(settings.provider(), settings.loadSpec(), settings.options(), settings.log(), prog,
-			settings.monitor(), romInfo);
+		// Log the detected cartridge mapping mode once per load operation.
+		logDetectedRomType(romInfo);
+		prog.setEventsEnabled(false);
+		int transactionID = prog.startTransaction("Loading - " + getName());
+		boolean success = false;
+		try {
+			RomLoader loader = romInfo.getLoader();
+			success = loader.load(settings.provider(), settings.loadSpec(), settings.options(), settings.log(), prog,
+				settings.monitor(), romInfo);
+			if (success) {
+				applySnesAnalysisHelpers(prog, settings.provider(), settings.options(), romInfo);
+			}
+		}
+		finally {
+			prog.endTransaction(transactionID, success);
+			prog.setEventsEnabled(true);
+		}
+
+		if (!success) {
+			throw new LoadException("Failed to load SNES ROM");
+		}
+
+		ghidra.app.plugin.core.analysis.AutoAnalysisManager.getAnalysisManager(prog)
+				.startAnalysis(settings.monitor());
+		createFunctionsFromJsrAndJsl(prog);
 	}
 
 	@Override
@@ -148,6 +172,8 @@ public class SnesLoader extends AbstractProgramLoader {
 			throws IOException, LoadException, CancelledException {
 		List<Loaded<Program>> programs = new ArrayList<>();
 		RomInfo romInfo = detectUniqueRomKind(settings.provider());
+		// Log the detected cartridge mapping mode once per load operation.
+		logDetectedRomType(romInfo);
 		Program prog = createProgram(settings);
 		boolean success = loadWithTransaction(settings.provider(), settings.loadSpec(), settings.options(),
 			settings.log(), prog, settings.monitor(), romInfo);
@@ -171,6 +197,7 @@ public class SnesLoader extends AbstractProgramLoader {
 			success = loader.load(provider, loadSpec, options, log, prog, monitor, romInfo);
 			if (success) {
 				applySnesAnalysisHelpers(prog, provider, options, romInfo);
+				createFunctionsFromJsrAndJsl(prog);
 			}
 			return success;
 		}
@@ -408,5 +435,51 @@ public class SnesLoader extends AbstractProgramLoader {
 			}
 		}
 		return defaultValue;
+	}
+
+	private void createFunctionsFromJsrAndJsl(Program program) {
+		var instructions = program.getListing().getInstructions(true);
+		while (instructions.hasNext()) {
+			Instruction instruction = instructions.next();
+			String mnemonic = instruction.getMnemonicString();
+			if (!"JSR".equalsIgnoreCase(mnemonic) && !"JSL".equalsIgnoreCase(mnemonic)) {
+				continue;
+			}
+
+			try {
+				Object[] operands = instruction.getOpObjects(0);
+				if (operands == null || operands.length == 0) {
+					continue;
+				}
+
+				for (Object operand : operands) {
+					if (!(operand instanceof Address)) {
+						continue;
+					}
+
+					Address target = (Address) operand;
+					if (program.getFunctionManager().getFunctionAt(target) != null) {
+						continue;
+					}
+
+					try {
+						program.getFunctionManager().createFunction(null, target, new AddressSet(target),
+							SourceType.ANALYSIS);
+					}
+					catch (Exception ignored) {
+						// Ignore duplicates/invalid targets; keep the pass resilient.
+					}
+				}
+			}
+			catch (Exception ignored) {
+				// Ignore malformed operands or decoder edge cases.
+			}
+		}
+	}
+
+	// Keep ROM-kind logging centralized so both load paths emit the same format.
+	private void logDetectedRomType(RomInfo romInfo) {
+		String detectedType = romInfo.getDescription().contains("LO_ROM") ? "LoROM" : "HiROM";
+		Msg.info(this, "Detected ROM type: " + detectedType);
 	}
 }
