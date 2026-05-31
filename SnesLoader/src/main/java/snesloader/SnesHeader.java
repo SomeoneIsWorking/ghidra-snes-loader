@@ -38,8 +38,10 @@ public final class SnesHeader {
 
 	public boolean looksValid( ) {
 		// resetVector must point to bus address 0x8000 or higher. Lower addresses contain RAM and IO.
-		boolean validReset = Integer.compareUnsigned(resetVector, 0x8000) >= 0;
-		boolean validChecksum = checksum + checksumComplement == (short) 0xFFFF;
-		return validReset && validChecksum;
+		// We intentionally do not require a valid checksum pair, because many real-world dumps/hacks
+		// ship with stale header checksums.
+		int unsignedReset = Short.toUnsignedInt(resetVector);
+		boolean validReset = unsignedReset >= 0x8000 && unsignedReset != 0xFFFF;
+		return validReset;
 	}
 }
